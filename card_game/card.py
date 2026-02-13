@@ -140,3 +140,45 @@ class MedPatch(HealCard):
             description="Restores 2 HP",
             heal_amount=2
         )
+
+
+class BasicDefense(Card):
+    """
+    Defense card that reduces incoming damage when played as a counter.
+
+    Defense cards can only be played in response to an attack.
+    Their defense_value reduces the incoming damage.
+    """
+
+    def __init__(self, name: str, description: str, defense_value: int):
+        """
+        Initialize a defense card.
+
+        Args:
+            name: Display name of the card
+            description: Text description of card effect
+            defense_value: Amount of damage this card blocks
+        """
+        super().__init__(name, description, CardType.DEFENSE)
+        self.defense_value = defense_value
+
+    def play(self, player: 'Player', target: Optional['Player'] = None) -> None:
+        """
+        Defense cards don't have a direct play effect.
+
+        Their effect is applied during attack resolution when used as a counter.
+        """
+        pass
+
+
+@register_card("energy_shield")
+class EnergyShield(BasicDefense):
+    """Energy Shield - blocks 2 damage."""
+
+    def __init__(self):
+        """Initialize Energy Shield card."""
+        super().__init__(
+            name="Energy Shield",
+            description="Block 2 damage",
+            defense_value=2
+        )
