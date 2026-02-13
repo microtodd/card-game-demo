@@ -30,6 +30,10 @@ def create_starter_deck() -> List[Card]:
     for _ in range(2):
         deck.append(create_card("med_patch"))
 
+    # Add 2x Energy Shield (defense)
+    for _ in range(2):
+        deck.append(create_card("energy_shield"))
+
     return deck
 
 
