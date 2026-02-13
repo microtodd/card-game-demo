@@ -1,11 +1,29 @@
 """Card combat game engine."""
 
 import pygame
+from enum import Enum
 from typing import Optional, Tuple
 from game_context import GameContext
 from card_game.player import Player
 from card_game.deck_factory import create_starter_deck, create_intro_enemy_deck, create_chapter_boss_deck, create_grinder_enemy_deck, create_test_small_deck
 from card_game.card import Card, CardType
+
+
+class CombatState(Enum):
+    """States for the combat state machine."""
+    PLAYER_TURN = "player_turn"
+    PLAYER_DISCARDING = "player_discarding"
+    PLAYER_CARD_ANIMATING = "player_card_animating"
+    ENEMY_THINKING = "enemy_thinking"
+    ENEMY_CARD_ANIMATING = "enemy_card_animating"
+    ENEMY_DISCARD_ANIMATING = "enemy_discard_animating"
+    WAITING_FOR_COUNTER = "waiting_for_counter"
+    COUNTER_ANIMATING = "counter_animating"
+    WAITING_FOR_RESOLVE = "waiting_for_resolve"
+    RESOLVE_WITH_COUNTER = "resolve_with_counter"
+    RESHUFFLING = "reshuffling"
+    VICTORY = "victory"
+    DEFEAT = "defeat"
 
 
 class CardAnimation:
@@ -131,10 +149,10 @@ class CardCombat:
         self.turn = 1
         self.round = 1
 
-        # Combat state
-        self.combat_active = True
-        self.victory = False
-        self.defeat = False
+        # Combat state machine
+        self.state = CombatState.PLAYER_TURN
+
+        # Overlays/modifiers (not part of main state)
         self.exit_confirmation_modal = False
         self.last_stand_active = False
 
@@ -143,23 +161,26 @@ class CardCombat:
         self.staged_card = None
         self.staged_card_index = None
         self.staged_card_owner = None  # "player" or "enemy"
-        self.waiting_for_resolve = False
-        self.discard_select = False
+        self.returning_card = None  # Card being animated back to hand
+        self.returning_card_index = None
         self.discard_cancel_hover = False
         self.discard_confirm_hover = False
 
-        # Enemy turn system
-        self.enemy_turn = False
+        # Enemy turn timing
         self.enemy_think_timer = 0.0
         self.enemy_think_duration = 1.5  # seconds
-        self.enemy_discarding_card = None # Track card being discarded by AI
+        self.enemy_discarding_card = None  # Track card being discarded by AI
 
         # Reshuffle system
-        self.reshuffling_deck = False
         self.reshuffle_timer = 0.0
         self.reshuffle_duration = 2.0  # seconds
         self.reshuffle_target = None  # "player" or "enemy" - who is reshuffling
         self.reshuffle_owner = None  # "player" or "enemy" - whose turn just ended
+
+        # Counter system
+        self.counter_card = None  # Selected defense card
+        self.counter_card_index = None
+        self.skip_counter_hovered = False
 
     def _initialize_enemy_deck(self, enemy_deck: str) -> None:
         """
@@ -199,127 +220,181 @@ class CardCombat:
         for event in events:
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    # If exit confirmation modal is showing, close it
-                    if self.exit_confirmation_modal:
-                        self.exit_confirmation_modal = False
-                    # Otherwise, show the confirmation modal
-                    else:
-                        self.exit_confirmation_modal = True
+                    # Toggle exit confirmation modal
+                    self.exit_confirmation_modal = not self.exit_confirmation_modal
 
-                # Handle Enter key to confirm exit when modal is showing
-                if event.key == pygame.K_RETURN and self.exit_confirmation_modal:
+                elif event.key == pygame.K_RETURN and self.exit_confirmation_modal:
                     return 'menu'
 
-                # Handle victory/defeat modal dismissal with SPACE
-                if (self.victory or self.defeat) and event.key == pygame.K_SPACE:
-
-                    # Decide on next step
+                elif event.key == pygame.K_SPACE and self.state in (CombatState.VICTORY, CombatState.DEFEAT):
                     return self._after_combat()
 
-            if event.type == pygame.MOUSEBUTTONDOWN:
-                if event.button == 1:  # Left click
-                    # Handle victory/defeat modal dismissal with click
-                    if self.victory or self.defeat:
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                result = self._handle_click(event.pos)
+                if result:
+                    return result
 
-                        # decide on next step
-                        return self._after_combat()
-
-                    # Handle resolve click
-                    elif self.waiting_for_resolve:
-                        # Calculate hitboxes for Staged Card and Resolve Button
-                        layout = self._get_card_layout()
-                        card_width = layout['card_width']
-                        card_height = layout['card_height']
-                        staging_x = (self.screen.get_width() - card_width) // 2
-                        staging_y = (self.screen.get_height() - card_height) // 2
-                        
-                        staged_card_rect = pygame.Rect(staging_x, staging_y, card_width, card_height)
-                        
-                        # Resolve box is positioned relative to card
-                        resolve_box_x = staging_x + card_width + 40
-                        resolve_box_y = staging_y + card_height // 2
-                        resolve_rect = pygame.Rect(resolve_box_x, resolve_box_y - 40, 200, 80)
-
-                        if resolve_rect.collidepoint(event.pos):
-                            self._resolve_staged_card()
-                        elif staged_card_rect.collidepoint(event.pos):
-                            self._cancel_staged_card()
-
-                    # Only allow combat actions if combat is active, not animating, and not enemy turn
-                    elif self.combat_active and not self.active_animations and not self.enemy_turn:
-                        # Check if debug buttons were clicked
-                        if self.game_context.debug_mode:
-                            if self.debug_win_button_hovered:
-                                self._debug_auto_win()
-                            elif self.debug_lose_button_hovered:
-                                self._debug_auto_lose()
-                        # Check if draw button was clicked
-                        if self.draw_button_hovered:
-                            if not self.last_stand_active:
-                                self.player.draw_card()
-                        # Check if pass button was clicked
-                        elif self.pass_button_hovered:
-                            if self.last_stand_active:
-                                self.combat_active = False
-                                self.defeat = True
-                                self._handle_combat_completion("defeat")
-                            else:
-                                self._start_enemy_turn()
-                        
-                        # Discard sub-section
-                        elif self.discard_button_hovered:
-                            self._start_discard_select()
-                        elif self.discard_select:
-                            if self.discard_cancel_hover:
-                                self.discard_select = False
-                                self.discard_cards_hovered = {
-                                    0: False,
-                                    1: False,
-                                    2: False,
-                                    3: False,
-                                    4: False
-                                }
-
-                            # Check if a card was selected for discard, and hover it
-                            elif self.hovered_card_index is not None and self.hovered_card_index < len(self.player.hand):
-                                if self.discard_cards_hovered[self.hovered_card_index]:
-                                    self.discard_cards_hovered[self.hovered_card_index] = False
-                                else:
-                                    self.discard_cards_hovered[self.hovered_card_index] = True
-                            
-                            # If discard button clicked, discard those cards
-                            elif self.discard_confirm_hover:
-
-                                # If no cards are hovered, then ignore this click
-                                if not any(self.discard_cards_hovered.values()):
-                                    return None
-
-                                for i in reversed(range(5)):
-                                    if self.discard_cards_hovered[i]:
-                                        self.player.discard_pile.append(self.player.hand.pop(i))
-                                self.discard_select = False
-                                self.discard_cards_hovered = {
-                                    0: False,
-                                    1: False,
-                                    2: False,
-                                    3: False,
-                                    4: False
-                                }
-                                # Player's turn also ends
-                                self._start_enemy_turn()
-
-                        # Start card animation if a card is hovered
-                        elif self.hovered_card_index is not None and self.hovered_card_index < len(self.player.hand):
-                            card = self.player.hand[self.hovered_card_index]
-                            # Check if card is playable (Attack or Heal)
-                            if self.last_stand_active:
-                                # In Last Stand, only Heal cards are playable
-                                if hasattr(card, 'card_type') and card.card_type.value == 'heal':
-                                    self._start_card_animation(self.hovered_card_index)
-                            else:
-                                if hasattr(card, 'card_type') and card.card_type.value in ['attack', 'heal']:
-                                    self._start_card_animation(self.hovered_card_index)
         return None
+
+    def _handle_click(self, pos: Tuple[int, int]) -> Optional[str]:
+        """Handle mouse click based on current state."""
+        match self.state:
+            case CombatState.VICTORY | CombatState.DEFEAT:
+                return self._after_combat()
+
+            case CombatState.WAITING_FOR_RESOLVE | CombatState.RESOLVE_WITH_COUNTER:
+                self._handle_resolve_click(pos)
+
+            case CombatState.WAITING_FOR_COUNTER:
+                self._handle_counter_click(pos)
+
+            case CombatState.PLAYER_TURN:
+                self._handle_player_turn_click(pos)
+
+            case CombatState.PLAYER_DISCARDING:
+                self._handle_discard_click(pos)
+
+            case _:
+                # Other states don't respond to clicks
+                pass
+
+        return None
+
+    def _handle_resolve_click(self, pos: Tuple[int, int]) -> None:
+        """Handle clicks during resolve state."""
+        layout = self._get_card_layout()
+        card_width = layout['card_width']
+        card_height = layout['card_height']
+        staging_x = (self.screen.get_width() - card_width) // 2
+        staging_y = (self.screen.get_height() - card_height) // 2
+
+        staged_card_rect = pygame.Rect(staging_x, staging_y, card_width, card_height)
+
+        # Resolve box is positioned relative to card
+        resolve_box_x = staging_x + card_width + 40
+        resolve_box_y = staging_y + card_height // 2
+        resolve_rect = pygame.Rect(resolve_box_x, resolve_box_y - 40, 200, 80)
+
+        if resolve_rect.collidepoint(pos):
+            self._resolve_staged_card()
+        elif staged_card_rect.collidepoint(pos) and self.staged_card_owner == "player":
+            # Only player can cancel their own cards
+            self._cancel_staged_card()
+
+    def _handle_counter_click(self, pos: Tuple[int, int]) -> None:
+        """Handle clicks during counter selection."""
+        layout = self._get_card_layout()
+
+        # Check if skip button was clicked
+        skip_button_rect = self._get_skip_counter_button_rect(layout)
+        if skip_button_rect.collidepoint(pos):
+            self.state = CombatState.WAITING_FOR_RESOLVE
+            return
+
+        # Check if draw button was clicked (uses existing action button)
+        if self.draw_button_hovered and len(self.player.hand) < 5:
+            # Draw card
+            self.player.draw_card()
+            # Stay in WAITING_FOR_COUNTER - player can now choose from new cards
+            return
+
+        # Check if a defense card in hand was clicked
+        for i, card in enumerate(self.player.hand):
+            if card.card_type == CardType.DEFENSE:
+                card_x = layout['start_x'] + (i * (layout['card_width'] + layout['gap']))
+                card_rect = pygame.Rect(card_x, layout['card_y'] - layout['hover_lift'],
+                                       layout['card_width'], layout['card_height'])
+                if card_rect.collidepoint(pos):
+                    # Select this defense card as counter and animate it
+                    self.counter_card = self.player.hand.pop(i)
+                    self.counter_card_index = i
+                    self._start_counter_animation()
+                    break
+
+    def _start_counter_animation(self) -> None:
+        """Start animation for the counter card moving to staging area."""
+        layout = self._get_card_layout()
+        card_width = layout['card_width']
+        card_height = layout['card_height']
+
+        # Start position: where the card was in hand
+        start_x = layout['start_x'] + (self.counter_card_index * (card_width + layout['gap']))
+        start_y = layout['card_y'] - layout['hover_lift']
+        start_pos = (start_x, start_y)
+
+        # End position: offset from the attack card (to the left)
+        staging_x = (self.screen.get_width() - card_width) // 2
+        staging_y = (self.screen.get_height() - card_height) // 2
+        end_pos = (staging_x - card_width - 20, staging_y)
+
+        animation = CardAnimation(self.counter_card, self.counter_card_index, start_pos, end_pos, 0.2)
+        self.active_animations.append(animation)
+        self.state = CombatState.COUNTER_ANIMATING
+
+    def _handle_player_turn_click(self, pos: Tuple[int, int]) -> None:
+        """Handle clicks during player's turn."""
+        # Check debug buttons
+        if self.game_context.debug_mode:
+            if self.debug_win_button_hovered:
+                self._debug_auto_win()
+                return
+            elif self.debug_lose_button_hovered:
+                self._debug_auto_lose()
+                return
+
+        # Check draw button
+        if self.draw_button_hovered and not self.last_stand_active:
+            self.player.draw_card()
+            return
+
+        # Check pass button
+        if self.pass_button_hovered:
+            if self.last_stand_active:
+                self.state = CombatState.DEFEAT
+                self._handle_combat_completion("defeat")
+            else:
+                self._start_enemy_turn()
+            return
+
+        # Check discard button
+        if self.discard_button_hovered and not self.last_stand_active:
+            self._start_discard_select()
+            return
+
+        # Check if a card was clicked
+        if self.hovered_card_index is not None and self.hovered_card_index < len(self.player.hand):
+            card = self.player.hand[self.hovered_card_index]
+            if self.last_stand_active:
+                # In Last Stand, only Heal cards are playable
+                if hasattr(card, 'card_type') and card.card_type.value == 'heal':
+                    self._start_card_animation(self.hovered_card_index)
+            else:
+                if hasattr(card, 'card_type') and card.card_type.value in ['attack', 'heal']:
+                    self._start_card_animation(self.hovered_card_index)
+
+    def _handle_discard_click(self, pos: Tuple[int, int]) -> None:
+        """Handle clicks during discard selection."""
+        if self.discard_cancel_hover:
+            self.state = CombatState.PLAYER_TURN
+            self.discard_cards_hovered = {i: False for i in range(5)}
+            return
+
+        # Check if a card was selected for discard
+        if self.hovered_card_index is not None and self.hovered_card_index < len(self.player.hand):
+            self.discard_cards_hovered[self.hovered_card_index] = not self.discard_cards_hovered[self.hovered_card_index]
+            return
+
+        # Check if confirm button clicked
+        if self.discard_confirm_hover:
+            if not any(self.discard_cards_hovered.values()):
+                return  # No cards selected
+
+            for i in reversed(range(5)):
+                if self.discard_cards_hovered[i]:
+                    self.player.discard_pile.append(self.player.hand.pop(i))
+
+            self.discard_cards_hovered = {i: False for i in range(5)}
+            self._start_enemy_turn()
 
     def _start_card_animation(self, card_index: int, owner: str = "player") -> None:
         """
@@ -371,6 +446,12 @@ class CardCombat:
         self.staged_card_index = card_index
         self.staged_card_owner = owner
 
+        # Set animation state
+        if owner == "player":
+            self.state = CombatState.PLAYER_CARD_ANIMATING
+        else:
+            self.state = CombatState.ENEMY_CARD_ANIMATING
+
     def _cancel_staged_card(self) -> None:
         """
         Cancel the staged card and return it to the owner's hand.
@@ -398,19 +479,15 @@ class CardCombat:
         animation = CardAnimation(self.staged_card, self.staged_card_index, start_pos, end_pos, 0.2)
         self.active_animations.append(animation)
 
-        # We do NOT clear staged_card yet; we wait for animation to finish.
-        # But we need to signal that we are "un-staging".
-        # Actually, simpler approach: Put card back in hand NOW, animate a "ghost" or the real card.
-        
-        # Put card back in hand at specific index
-        if self.staged_card_owner == "player":
-            self.player.hand.insert(self.staged_card_index, self.staged_card)
-        
-        # Clear staging state immediately so UI updates
+        # Track the card being returned (for reinsertion after animation)
+        self.returning_card = self.staged_card
+        self.returning_card_index = self.staged_card_index
+
+        # Clear staging state - card will be reinserted when animation completes
         self.staged_card = None
         self.staged_card_index = None
         self.staged_card_owner = None
-        self.waiting_for_resolve = False
+        self.state = CombatState.PLAYER_CARD_ANIMATING
 
     def _start_enemy_discard_animation(self, card_index: int) -> None:
         """
@@ -430,12 +507,13 @@ class CardCombat:
         
         # Track this specifically as a discard action, not a play
         self.enemy_discarding_card = card
-        
+        self.state = CombatState.ENEMY_DISCARD_ANIMATING
+
         # We do NOT set self.staged_card, because we don't want to trigger _resolve_staged_card
 
     def _start_enemy_turn(self) -> None:
         """Start the enemy's turn with a thinking delay."""
-        self.enemy_turn = True
+        self.state = CombatState.ENEMY_THINKING
         self.enemy_think_timer = 0.0
 
     def _start_reshuffle(self, target: str, owner: str) -> None:
@@ -445,7 +523,7 @@ class CardCombat:
             target: "player" or "enemy" - who is reshuffling their deck
             owner: "player" or "enemy" - whose turn just ended
         """
-        self.reshuffling_deck = True
+        self.state = CombatState.RESHUFFLING
         self.reshuffle_timer = 0.0
         self.reshuffle_target = target
         self.reshuffle_owner = owner
@@ -468,33 +546,30 @@ class CardCombat:
         # Store owner for turn progression
         owner = self.reshuffle_owner
 
-        # Clear reshuffle state
-        self.reshuffling_deck = False
+        # Clear reshuffle data
         self.reshuffle_target = None
         self.reshuffle_owner = None
 
-        # Continue turn progression
-        if self.combat_active:
+        # Continue turn progression (only if combat is still active)
+        if self.state not in (CombatState.VICTORY, CombatState.DEFEAT):
             if owner == "player":
                 # Player's turn just ended, start enemy turn
                 self._start_enemy_turn()
             else:
                 # Enemy's turn just ended, back to player turn
-                self.enemy_turn = False
-                # Enemy draws a card after playing
                 self.enemy.draw_card()
-                # Increment turn counter
                 self.turn += 1
+                self.state = CombatState.PLAYER_TURN
 
     def _start_discard_select(self) -> None:
         """Start the discard selection process."""
-        self.discard_select = True
+        self.state = CombatState.PLAYER_DISCARDING
 
     def _execute_enemy_action(self) -> None:
         """Execute the enemy's action (play a card)."""
 
         if not self.enemy.hand:
-            self.enemy_turn = False
+            self.state = CombatState.PLAYER_TURN
             return
 
         # 1. Calculate utility for all cards
@@ -557,6 +632,18 @@ class CardCombat:
 
         return score
 
+    def _should_open_counter_window(self) -> bool:
+        """Check if player should get a chance to counter the staged card."""
+        if not self.staged_card:
+            return False
+        # Only counter enemy attacks
+        if self.staged_card_owner != "enemy":
+            return False
+        if self.staged_card.card_type != CardType.ATTACK:
+            return False
+        # Check if player has any defense cards
+        return any(c.card_type == CardType.DEFENSE for c in self.player.hand)
+
     def _resolve_staged_card(self) -> None:
         """Execute the staged card's effect and move it to discard."""
         if self.staged_card:
@@ -573,72 +660,82 @@ class CardCombat:
                 target = self.player
                 discard_pile = self.enemy.discard_pile
 
-            # Play the card
-            self.staged_card.play(source, target)
+            # Apply counter if one was played
+            if self.counter_card and self.staged_card.card_type == CardType.ATTACK:
+                # Reduce damage by defense value
+                original_damage = self.staged_card.damage
+                reduced_damage = max(0, original_damage - self.counter_card.defense_value)
+                # Temporarily modify damage for this resolution
+                self.staged_card.damage = reduced_damage
+                self.staged_card.play(source, target)
+                self.staged_card.damage = original_damage  # Restore original damage
+                # Discard the counter card
+                self.player.discard_pile.append(self.counter_card)
+                self.counter_card = None
+                self.counter_card_index = None
+            else:
+                # Normal resolution
+                self.staged_card.play(source, target)
+
             discard_pile.append(self.staged_card)
 
             # Check for victory/defeat/last stand
             self._check_vital_signs()
 
-            if not self.combat_active:
+            if self.state in (CombatState.VICTORY, CombatState.DEFEAT):
                 return
 
             # Clear staging area
             self.staged_card = None
             self.staged_card_index = None
             self.staged_card_owner = None
-            self.waiting_for_resolve = False
 
             # Check for empty hand and deck. If so, reshuffle the discard pile
-            if self.combat_active:
-                # Check player's deck
-                if len(self.player.hand) == 0 and len(self.player.deck) == 0 and len(self.player.discard_pile) > 0:
-                    self._start_reshuffle("player", owner)
-                    return  # Exit early, reshuffle will continue the flow
+            # Check player's deck
+            if len(self.player.hand) == 0 and len(self.player.deck) == 0 and len(self.player.discard_pile) > 0:
+                self._start_reshuffle("player", owner)
+                return  # Exit early, reshuffle will continue the flow
 
-                # Check enemy's deck
-                if len(self.enemy.hand) == 0 and len(self.enemy.deck) == 0 and len(self.enemy.discard_pile) > 0:
-                    self._start_reshuffle("enemy", owner)
-                    return  # Exit early, reshuffle will continue the flow
+            # Check enemy's deck
+            if len(self.enemy.hand) == 0 and len(self.enemy.deck) == 0 and len(self.enemy.discard_pile) > 0:
+                self._start_reshuffle("enemy", owner)
+                return  # Exit early, reshuffle will continue the flow
 
             # Handle turn progression
-            if self.combat_active and not self.last_stand_active:
+            if not self.last_stand_active:
                 if owner == "player":
                     # Player's turn just ended, start enemy turn
                     self._start_enemy_turn()
                 else:
                     # Enemy's turn just ended, back to player turn
-                    self.enemy_turn = False
                     # Enemy draws until hand is full (5 cards)
                     while len(self.enemy.hand) < 5:
                         if not self.enemy.draw_card():
-                            break # Deck is empty
+                            break  # Deck is empty
                     # Increment turn counter
                     self.turn += 1
+                    self.state = CombatState.PLAYER_TURN
 
     def _check_vital_signs(self) -> None:
         """Check if any player is defeated or entering Last Stand."""
         # Check Enemy
         if self.enemy.is_defeated():
-            self.combat_active = False
-            self.victory = True
+            self.state = CombatState.VICTORY
             self._handle_combat_completion("victory")
             return
 
         # Check Player
         if self.player.is_defeated():
             # Check for heals in hand
-            has_heals = False
-            for card in self.player.hand:
-                if hasattr(card, 'card_type') and card.card_type.value == 'heal':
-                    has_heals = True
-                    break
-            
+            has_heals = any(
+                hasattr(card, 'card_type') and card.card_type.value == 'heal'
+                for card in self.player.hand
+            )
+
             if has_heals:
                 self.last_stand_active = True
             else:
-                self.combat_active = False
-                self.defeat = True
+                self.state = CombatState.DEFEAT
                 self._handle_combat_completion("defeat")
         else:
             # Player is alive. If they were in last stand, they are safe now.
@@ -661,20 +758,17 @@ class CardCombat:
     def _debug_auto_win(self) -> None:
         """Debug method to instantly win the combat."""
         self.enemy.hit_points = 0
-        self.combat_active = False
-        self.victory = True
+        self.state = CombatState.VICTORY
         self._handle_combat_completion("victory")
 
     def _debug_auto_lose(self) -> None:
         """Debug method to instantly lose the combat."""
         self.player.hit_points = 0
-        self.combat_active = False
-        self.defeat = True
+        self.state = CombatState.DEFEAT
         self._handle_combat_completion("defeat")
 
     def _after_combat(self) -> None:
-
-        # For demo, just reset the combat to play again. In a full game, this would transition back to the overworld or next state.
+        # For demo, just reset combat to play again. In a full game, this would transition to rewards or next battle.
         self._reset_combat()
         return None
 
@@ -696,10 +790,8 @@ class CardCombat:
         self.player.hit_points = self.player.max_hit_points
         self.enemy.hit_points = self.enemy.max_hit_points
 
-        # Reset combat state
-        self.combat_active = True
-        self.victory = False
-        self.defeat = False
+        # Reset state machine
+        self.state = CombatState.PLAYER_TURN
         self.turn = 1
         self.round += 1
         self.last_stand_active = False
@@ -709,18 +801,20 @@ class CardCombat:
         self.staged_card = None
         self.staged_card_index = None
         self.staged_card_owner = None
-        self.waiting_for_resolve = False
+        self.returning_card = None
+        self.returning_card_index = None
 
-        # Reset enemy turn state
-        self.enemy_turn = False
+        # Reset timers
         self.enemy_think_timer = 0.0
         self.enemy_discarding_card = None
-
-        # Reset reshuffle state
-        self.reshuffling_deck = False
         self.reshuffle_timer = 0.0
         self.reshuffle_target = None
         self.reshuffle_owner = None
+
+        # Reset counter state
+        self.counter_card = None
+        self.counter_card_index = None
+        self.skip_counter_hovered = False
 
     def update(self, dt: float) -> None:
         """
@@ -729,37 +823,60 @@ class CardCombat:
         Args:
             dt: Delta time in seconds
         """
-        # Update enemy thinking timer
-        if self.enemy_turn and not self.waiting_for_resolve and not self.active_animations:
-            self.enemy_think_timer += dt
-            if self.enemy_think_timer >= self.enemy_think_duration:
-                # Thinking time is over, execute enemy action
-                self._execute_enemy_action()
+        match self.state:
+            case CombatState.ENEMY_THINKING:
+                self.enemy_think_timer += dt
+                if self.enemy_think_timer >= self.enemy_think_duration:
+                    self._execute_enemy_action()
 
-        # Update reshuffle timer
-        if self.reshuffling_deck:
-            self.reshuffle_timer += dt
-            if self.reshuffle_timer >= self.reshuffle_duration:
-                # Reshuffle time is over, execute the reshuffle
-                self._execute_reshuffle()
+            case CombatState.RESHUFFLING:
+                self.reshuffle_timer += dt
+                if self.reshuffle_timer >= self.reshuffle_duration:
+                    self._execute_reshuffle()
 
-        # Update active animations
-        for animation in self.active_animations[:]:  # Copy list to avoid modification during iteration
+            case CombatState.PLAYER_CARD_ANIMATING | CombatState.ENEMY_CARD_ANIMATING | CombatState.ENEMY_DISCARD_ANIMATING | CombatState.COUNTER_ANIMATING:
+                self._update_animations(dt)
+
+            case _:
+                # Other states don't need update logic
+                pass
+
+    def _update_animations(self, dt: float) -> None:
+        """Update active animations and handle completion transitions."""
+        for animation in self.active_animations[:]:
             if animation.update(dt):
-                # Animation complete
                 self.active_animations.remove(animation)
-                # If no more animations and we have a staged card, wait for resolve
-                if not self.active_animations and self.staged_card:
-                    self.waiting_for_resolve = True
-                
-                # If no more animations and we were discarding, finish the discard
-                if not self.active_animations and self.enemy_discarding_card:
-                    self.enemy.discard_pile.append(self.enemy_discarding_card)
-                    self.enemy_discarding_card = None
-                    # End turn logic
-                    self.enemy_turn = False
-                    self.enemy.draw_card()
-                    self.turn += 1
+
+                # All animations complete - determine next state
+                if not self.active_animations:
+                    match self.state:
+                        case CombatState.PLAYER_CARD_ANIMATING:
+                            # Check if this was a return animation or a play animation
+                            if self.returning_card:
+                                # Reinsert card into hand
+                                self.player.hand.insert(self.returning_card_index, self.returning_card)
+                                self.returning_card = None
+                                self.returning_card_index = None
+                                self.state = CombatState.PLAYER_TURN
+                            else:
+                                # Normal play - go to resolve
+                                self.state = CombatState.WAITING_FOR_RESOLVE
+
+                        case CombatState.ENEMY_CARD_ANIMATING:
+                            if self._should_open_counter_window():
+                                self.state = CombatState.WAITING_FOR_COUNTER
+                            else:
+                                self.state = CombatState.WAITING_FOR_RESOLVE
+
+                        case CombatState.ENEMY_DISCARD_ANIMATING:
+                            self.enemy.discard_pile.append(self.enemy_discarding_card)
+                            self.enemy_discarding_card = None
+                            self.enemy.draw_card()
+                            self.turn += 1
+                            self.state = CombatState.PLAYER_TURN
+
+                        case CombatState.COUNTER_ANIMATING:
+                            self.state = CombatState.RESOLVE_WITH_COUNTER
 
     # =========================================================================
     # RENDER HELPER METHODS
@@ -767,11 +884,7 @@ class CardCombat:
 
     def _can_player_act(self) -> bool:
         """Check if the player can currently take actions."""
-        return (self.combat_active and
-                not self.active_animations and
-                not self.waiting_for_resolve and
-                not self.enemy_turn and
-                not self.reshuffling_deck)
+        return self.state == CombatState.PLAYER_TURN
 
     def _get_card_layout(self) -> dict:
         """Get common card layout dimensions used across render methods."""
@@ -794,6 +907,17 @@ class CardCombat:
             'start_x': start_x,
             'card_y': card_y,
         }
+
+    def _get_skip_counter_button_rect(self, layout: dict) -> pygame.Rect:
+        """Get the rectangle for the Skip Counter button."""
+        button_width = 150
+        button_height = 50
+        # Position to the right of the staged card (same as resolve button area)
+        staging_x = (self.screen.get_width() - layout['card_width']) // 2
+        staging_y = (self.screen.get_height() - layout['card_height']) // 2
+        button_x = staging_x + layout['card_width'] + 40
+        button_y = staging_y + layout['card_height'] // 2 - button_height // 2
+        return pygame.Rect(button_x, button_y, button_width, button_height)
 
     def _render_hud(self) -> None:
         """Render the heads-up display (title, instructions, turn/round counters)."""
@@ -985,35 +1109,65 @@ class CardCombat:
         # Reset hovered card tracking
         self.hovered_card_index = None
 
-        for i in range(layout['hand_size']):
-            card_x = layout['start_x'] + (i * (layout['card_width'] + layout['gap']))
+        # Allow interaction during player turn OR discard selection
+        can_interact = player_can_act or self.state == CombatState.PLAYER_DISCARDING
+
+        # Check if player has a card staged or returning (need to show gap in hand)
+        gap_index = None
+        if self.staged_card is not None and self.staged_card_owner == "player" and self.staged_card_index is not None:
+            gap_index = self.staged_card_index
+        elif self.returning_card is not None and self.returning_card_index is not None:
+            gap_index = self.returning_card_index
+
+        for visual_slot in range(layout['hand_size']):
+            card_x = layout['start_x'] + (visual_slot * (layout['card_width'] + layout['gap']))
+
+            # Determine actual hand index, accounting for gap
+            if gap_index is not None:
+                if visual_slot == gap_index:
+                    # This is where the staged/returning card was - render empty slot
+                    self._render_empty_card_slot(card_x, layout['card_y'], layout)
+                    continue
+                elif visual_slot < gap_index:
+                    actual_index = visual_slot
+                else:
+                    # After the gap, shift index down by 1
+                    actual_index = visual_slot - 1
+            else:
+                actual_index = visual_slot
+
+            # Check if we have a card at this actual index
+            if actual_index >= len(self.player.hand):
+                self._render_empty_card_slot(card_x, layout['card_y'], layout)
+                continue
+
+            card = self.player.hand[actual_index]
+
+            # Skip defense cards during counter prompt (they're rendered separately)
+            if self.state == CombatState.WAITING_FOR_COUNTER and card.card_type == CardType.DEFENSE:
+                continue
 
             # Check hover state
             base_card_rect = pygame.Rect(card_x, layout['card_y'], layout['card_width'], layout['card_height'])
-            is_hovering = base_card_rect.collidepoint(mouse_pos) and player_can_act
+            is_hovering = base_card_rect.collidepoint(mouse_pos) and can_interact
 
             # In Last Stand, only allow hovering Heal cards
-            if self.last_stand_active and i < len(self.player.hand):
-                card = self.player.hand[i]
+            if self.last_stand_active:
                 if not (hasattr(card, 'card_type') and card.card_type.value == 'heal'):
                     is_hovering = False
 
-            # Update hovered card index if hovering and card exists
-            if is_hovering and i < len(self.player.hand):
-                self.hovered_card_index = i
+            # Update hovered card index if hovering
+            if is_hovering:
+                self.hovered_card_index = actual_index
 
             # Also hover if selected for discard
-            if self.discard_cards_hovered[i]:
+            if self.discard_cards_hovered.get(actual_index, False):
                 is_hovering = True
 
             # Calculate y position with hover lift
             current_card_y = layout['card_y'] - layout['hover_lift'] if is_hovering else layout['card_y']
 
-            # Render card or empty slot
-            if i < len(self.player.hand):
-                self._render_card(self.player.hand[i], card_x, current_card_y, layout, highlighted=is_hovering)
-            else:
-                self._render_empty_card_slot(card_x, layout['card_y'], layout)
+            self._render_card(card, card_x, current_card_y, layout, highlighted=is_hovering)
 
     def _get_button_text(self, default_text: str) -> str:
         """Get button text based on current game state.
@@ -1024,13 +1178,15 @@ class CardCombat:
         Returns:
             Appropriate button text for current state
         """
-        if self.enemy_turn:
-            return "Enemy Turn"
-        elif not self.combat_active:
-            return "Combat Over"
-        elif self.discard_select:
-            return "Discarding"
-        return default_text
+        match self.state:
+            case CombatState.ENEMY_THINKING | CombatState.ENEMY_CARD_ANIMATING | CombatState.ENEMY_DISCARD_ANIMATING:
+                return "Enemy Turn"
+            case CombatState.VICTORY | CombatState.DEFEAT:
+                return "Combat Over"
+            case CombatState.PLAYER_DISCARDING:
+                return "Discarding"
+            case _:
+                return default_text
 
     def _render_action_button(self, x: int, y: int, width: int, height: int,
                               text: str, enabled: bool, mouse_pos: Tuple[int, int],
@@ -1087,9 +1243,10 @@ class CardCombat:
 
         hand_is_full = len(self.player.hand) >= layout['hand_size']
 
-        # Draw button
+        # Draw button - also enabled during counter window for draw-to-fill
         draw_y = layout['card_y']
-        draw_enabled = player_can_act and not hand_is_full and not self.discard_select and not self.last_stand_active
+        counter_draw_enabled = self.state == CombatState.WAITING_FOR_COUNTER and not hand_is_full
+        draw_enabled = (player_can_act and not hand_is_full and not self.last_stand_active) or counter_draw_enabled
         draw_text = "Hand Full" if hand_is_full else self._get_button_text("Draw Card")
         self.draw_button_hovered = self._render_action_button(
             button_x, draw_y, button_width, button_height,
@@ -1099,7 +1256,7 @@ class CardCombat:
 
         # Pass button
         pass_y = draw_y + button_height + button_gap
-        pass_enabled = player_can_act and not self.discard_select # Always enabled (Pass or Give Up)
+        pass_enabled = player_can_act  # Always enabled when player can act (Pass or Give Up)
         pass_text = "Give Up" if self.last_stand_active else self._get_button_text("Pass Turn")
         self.pass_button_hovered = self._render_action_button(
             button_x, pass_y, button_width, button_height,
@@ -1109,7 +1266,7 @@ class CardCombat:
 
         # Discard button
         discard_y = pass_y + button_height + button_gap
-        discard_enabled = player_can_act and not self.discard_select and not self.last_stand_active
+        discard_enabled = player_can_act and not self.last_stand_active
         self.discard_button_hovered = self._render_action_button(
             button_x, discard_y, button_width, button_height,
             self._get_button_text("Discard"), discard_enabled, mouse_pos,
@@ -1132,7 +1289,9 @@ class CardCombat:
         Args:
             layout: Card layout dimensions
         """
-        if not (self.waiting_for_resolve and self.staged_card):
+        if self.state not in (CombatState.WAITING_FOR_RESOLVE, CombatState.RESOLVE_WITH_COUNTER):
+            return
+        if not self.staged_card:
             return
 
         card_width = layout['card_width']
@@ -1149,6 +1308,12 @@ class CardCombat:
 
         self._render_card(self.staged_card, staging_x, staging_y, layout,
                          highlighted=True, border_color=border_color)
+
+        # If there's a counter card, render it too
+        if self.state == CombatState.RESOLVE_WITH_COUNTER and self.counter_card:
+            counter_x = staging_x - card_width - 20
+            self._render_card(self.counter_card, counter_x, staging_y, layout,
+                             highlighted=True, border_color=(0, 200, 200))
 
         # Render "CLICK TO RESOLVE" indicator
         self._render_resolve_indicator(staging_x + card_width + 40, staging_y + card_height // 2)
@@ -1198,7 +1363,7 @@ class CardCombat:
         Args:
             mouse_pos: Current mouse position
         """
-        if not self.discard_select:
+        if self.state != CombatState.PLAYER_DISCARDING:
             return
 
         modal_width = 400
@@ -1244,9 +1409,71 @@ class CardCombat:
         cancel_text_rect = cancel_surface.get_rect(center=cancel_rect.center)
         self.screen.blit(cancel_surface, cancel_text_rect)
 
+    def _render_counter_prompt(self, mouse_pos: Tuple[int, int], layout: dict) -> None:
+        """Render the counter prompt when player can respond to an attack."""
+        if self.state != CombatState.WAITING_FOR_COUNTER:
+            return
+
+        # Render the staged attack card (same position as normal staged card)
+        card_width = layout['card_width']
+        card_height = layout['card_height']
+        staging_x = (self.screen.get_width() - card_width) // 2
+        staging_y = (self.screen.get_height() - card_height) // 2
+
+        # Draw the attack card with red border (enemy's card)
+        self._render_card(self.staged_card, staging_x, staging_y, layout,
+                         highlighted=True, border_color=(255, 100, 100))
+
+        # Draw "COUNTER?" prompt above the card
+        prompt_font = pygame.font.Font(None, 56)
+        prompt_surface = prompt_font.render("COUNTER?", True, (255, 255, 100))
+        prompt_rect = prompt_surface.get_rect(center=(self.screen.get_width() // 2, staging_y - 40))
+        self.screen.blit(prompt_surface, prompt_rect)
+
+        # Draw damage indicator
+        if hasattr(self.staged_card, 'damage'):
+            damage_text = f"Incoming: {self.staged_card.damage} damage"
+            damage_surface = self.card_font.render(damage_text, True, (255, 150, 150))
+            damage_rect = damage_surface.get_rect(center=(self.screen.get_width() // 2, staging_y - 10))
+            self.screen.blit(damage_surface, damage_rect)
+
+        # Draw Skip button
+        skip_rect = self._get_skip_counter_button_rect(layout)
+        self.skip_counter_hovered = skip_rect.collidepoint(mouse_pos)
+        skip_color = (150, 100, 100) if self.skip_counter_hovered else (100, 50, 50)
+        pygame.draw.rect(self.screen, skip_color, skip_rect)
+        pygame.draw.rect(self.screen, (255, 255, 255), skip_rect, 2)
+
+        skip_surface = self.card_font.render("Skip", True, (255, 255, 255))
+        skip_text_rect = skip_surface.get_rect(center=skip_rect.center)
+        self.screen.blit(skip_surface, skip_text_rect)
+
+        # Highlight defense cards in hand with special border
+        for i, card in enumerate(self.player.hand):
+            if card.card_type == CardType.DEFENSE:
+                card_x = layout['start_x'] + (i * (card_width + layout['gap']))
+                # Lift defense cards to show they're selectable
+                card_y = layout['card_y'] - layout['hover_lift']
+
+                # Check if this defense card is hovered
+                card_rect = pygame.Rect(card_x, card_y, card_width, card_height)
+                is_hovered = card_rect.collidepoint(mouse_pos)
+
+                # Draw with cyan/blue highlight for defense cards
+                border_color = (100, 255, 255) if is_hovered else (0, 200, 200)
+                self._render_card(card, card_x, card_y, layout,
+                                highlighted=is_hovered, border_color=border_color)
+
+        # Draw instruction text
+        instruction_text = "Click a DEFENSE card to counter, or Skip"
+        instruction_surface = self.card_font.render(instruction_text, True, (200, 200, 200))
+        instruction_rect = instruction_surface.get_rect(center=(self.screen.get_width() // 2,
+                                                                layout['card_y'] - layout['hover_lift'] - 20))
+        self.screen.blit(instruction_surface, instruction_rect)
+
     def _render_enemy_thinking_overlay(self) -> None:
         """Render the 'Enemy Thinking' overlay."""
-        if not (self.enemy_turn and not self.waiting_for_resolve and not self.active_animations):
+        if self.state != CombatState.ENEMY_THINKING:
             return
 
         box_width = 300
@@ -1264,7 +1491,7 @@ class CardCombat:
 
     def _render_reshuffle_overlay(self) -> None:
         """Render the 'Reshuffling Deck' overlay."""
-        if not self.reshuffling_deck:
+        if self.state != CombatState.RESHUFFLING:
             return
 
         box_width = 400
@@ -1403,12 +1630,12 @@ class CardCombat:
 
     def _render_victory_modal(self) -> None:
         """Render the victory modal."""
-        if self.victory:
+        if self.state == CombatState.VICTORY:
             self._render_end_game_modal("VICTORY!", (255, 255, 0), (0, 100, 0), (255, 255, 0))
 
     def _render_defeat_modal(self) -> None:
         """Render the defeat modal."""
-        if self.defeat:
+        if self.state == CombatState.DEFEAT:
             self._render_end_game_modal("DEFEAT!", (255, 100, 100), (100, 0, 0), (255, 0, 0))
 
     def _render_exit_confirmation_modal(self) -> None:
@@ -1468,6 +1695,7 @@ class CardCombat:
 
         # Render overlays and modals
         self._render_discard_modal(mouse_pos)
+        self._render_counter_prompt(mouse_pos, layout)
         self._render_enemy_thinking_overlay()
         self._render_reshuffle_overlay()
         self._render_last_stand_overlay()
